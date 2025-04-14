@@ -202,3 +202,8 @@ benchmarks/*.json
 # Linting
 actionlint
 shellcheck*/
+
+# Experiments
+results*/
+test_results/
+misc/

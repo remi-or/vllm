@@ -31,7 +31,7 @@ from vllm import _custom_ops as ops
 from vllm.attention import Attention, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size, get_tp_group
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
@@ -56,6 +56,20 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+
+## HFRK Switch board
+from hf_rocm_kernels import residual_rms, swiglu, skinny_gemm
+
+SKINNY_LIMIT = 16
+
+USE_SKINNY_QKV_PROJ = True
+USE_SKINNY_GATE_UP_PROJ = True
+USE_SKINNY_DOWN_PROJ = True
+
+USE_CUSTOM_SWIGLU = True         # Needs to be turned on if USE_SKINNY_DOWN_PROJ is True
+USE_CUSTOM_PRE_ATTN_RMS = True   # Needs to be turned on if USE_SKINNY_QKV_PROJ is True
+USE_CUSTOM_POST_ATTN_RMS = True  # Needs to be turned on if USE_SKINNY_GATE_UP_PROJ is True
+##
 
 
 class LlamaMLP(nn.Module):
@@ -92,20 +106,26 @@ class LlamaMLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
-        if current_platform.is_rocm() and x.shape[0] == 1 and x.shape[1] == 1:
-            out = torch.empty(x.shape[0],
-                              self.gate_up_proj.weight.shape[0] // 2,
-                              dtype=x.dtype,
-                              device=x.device)
-            ops.LLMM_Silu(self.gate_up_proj.weight, x.view(-1, x.size(-1)),
-                          out, 8)
-            x = out.view(x.shape[0], x.shape[1], out.shape[1])
+    def forward(self, x, gate_up_buffer=None):
+
+        if gate_up_buffer is not None:
+            x = skinny_gemm(x, self.gate_up_proj.weight, self.gate_up_proj.combined_scale, gate_up_buffer)
         else:
             x, _ = self.gate_up_proj(x)
-            x = self.act_fn(
-                x, self.down_proj.input_scale if self.use_fp8 else None)
-        x, _ = self.down_proj(x)
+
+        if USE_SKINNY_DOWN_PROJ and (x.size(0) <= SKINNY_LIMIT):
+            down_buffer = torch.empty((x.shape[0], 16384), dtype=torch.float16, device=x.device)
+            x = swiglu(x, self.down_proj.input_scale, down_buffer)
+        else:
+            down_buffer = None
+            x = swiglu(x, self.down_proj.input_scale) if USE_CUSTOM_SWIGLU else self.act_fn(x, None)
+
+        if down_buffer is not None:
+            x = skinny_gemm(x, self.down_proj.weight, self.down_proj.combined_scale, down_buffer)
+            torch.distributed.all_reduce(x)
+        else:
+            x, _ = self.down_proj(x)
+
         return x
 
 
@@ -218,8 +238,14 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        qkv_buffer: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+
+        if qkv_buffer is not None:
+            qkv = skinny_gemm(hidden_states, self.qkv_proj.weight, self.qkv_proj.combined_scale, qkv_buffer)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(
@@ -296,25 +322,61 @@ class LlamaDecoderLayer(nn.Module):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        scale = None if not self.use_fp8 else \
-            self.self_attn.qkv_proj.input_scale
+
+        # QKV buffer allocation
+        if (residual is not None) and (hidden_states.size(0) <= SKINNY_LIMIT) and USE_SKINNY_QKV_PROJ:
+            qkv_buffer = torch.empty(
+                size=(hidden_states.size(0), self.self_attn.qkv_proj.weight.size(1)),
+                dtype=torch.float16,
+                device=hidden_states.device
+            )
+        else:
+            qkv_buffer = None
+
+        # Pre-attention layer norm
+        scale = self.self_attn.qkv_proj.input_scale if self.use_fp8 else None
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states, None, scale)
+        elif USE_CUSTOM_PRE_ATTN_RMS and scale is not None:
+            hidden_states, residual = residual_rms(
+                input=hidden_states,
+                residual=residual,
+                weight=self.input_layernorm.weight,
+                epsilon=self.input_layernorm.variance_epsilon,
+                scale_tensor=self.self_attn.qkv_proj.input_scale,
+                next_buffer=qkv_buffer,
+            )
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual, scale)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual, scale)
+
+        # Self Attention
         hidden_states = self.self_attn(positions=positions,
                                        hidden_states=hidden_states,
                                        kv_cache=kv_cache,
-                                       attn_metadata=attn_metadata)
+                                       attn_metadata=attn_metadata,
+                                       qkv_buffer=qkv_buffer)
 
         # Fully Connected
-        scale = None if not self.use_fp8 else self.mlp.gate_up_proj.input_scale
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual, scale)
-        hidden_states = self.mlp(hidden_states)
+        scale = self.mlp.gate_up_proj.input_scale if self.use_fp8 else None
+
+        gate_up_buffer = None
+        if USE_SKINNY_GATE_UP_PROJ and (hidden_states.size(0) <= SKINNY_LIMIT):
+            gate_up_buffer = torch.empty((hidden_states.size(0), 13312), dtype=torch.float16, device=hidden_states.device)
+
+        if USE_CUSTOM_POST_ATTN_RMS and self.use_fp8:
+            hidden_states, residual = residual_rms(
+                input=hidden_states,
+                residual=residual,
+                weight=self.post_attention_layernorm.weight,
+                epsilon=self.post_attention_layernorm.variance_epsilon,
+                scale_tensor=self.mlp.gate_up_proj.input_scale,
+                next_buffer=gate_up_buffer
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual, scale)
+
+        hidden_states = self.mlp(hidden_states, gate_up_buffer=gate_up_buffer)
         return hidden_states, residual
 
 

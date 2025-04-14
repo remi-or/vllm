@@ -348,6 +348,21 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+        # Add combined scale and make weight row or col major
+        layer.combined_scale = layer.weight_scale * layer.input_scale
+        # Row-major
+        # if layer.weight.stride(1) == 1:
+        #     layer.weight.data = layer.weight.data.contiguous()
+        # # Column-major
+        # elif layer.weight.stride(0) == 1:
+        #     layer.weight.data = layer.weight.data.T.contiguous().T
+        # # Neither
+        # else:
+        #     logger.warning(
+        #         "Found a 2D parameter that is neither row-major"
+        #         f" nor col-major: {layer.weight.shape() = } {layer.weight.stride() = }"
+        #     )
+
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
