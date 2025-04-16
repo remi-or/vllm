@@ -9,6 +9,11 @@ Currently, the model patched is the Llama model in FP8, and kernels have been tu
 
 ## Setup
 
+### 0. Docker setup
+
+To run this code, use the docker image `rocm6.3.1_mi300_ubuntu22.04_py3.12_vllm_0.6.6` ([link](https://hub.docker.com/layers/rocm/vllm/rocm6.3.1_mi300_ubuntu22.04_py3.12_vllm_0.6.6/images/sha256-9a12ef62bbbeb5a4c30a01f702c8e025061f575aa129f291a49fbd02d6b4d6c9))  
+The corresponding commit is `84f5d47b04c26bd07721cc9c76d84b0915d7afd3` and this branch is based on it.  
+
 ### 1. Install HFRK
 
 ```
